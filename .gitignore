@@ -1,0 +1,31 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Pipeline outputs (regenerated daily by app.py / streamlit_app.py)
+Accenture_Closed_with_Insuff_*.xlsx
+Yesterday Done checks with other details as per client name - Bridge.csv
+Advance Tracker.csv
+Antecedent Details.csv
+downloads.htm
+downloads.htm.crdownload
+*.crdownload
+
+# Local/external component mapping (maintained outside the repo)
+mapping.xlsx
+mapping.xls.xlsx
+
+# Selenium / Playwright artifacts
+.playwright-mcp/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
