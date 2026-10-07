@@ -1,45 +1,40 @@
-"""Automates the Accenture 'Closed with Insuff' export from the AuthBridge MIS query browser.
+"""Automates the Accenture 'Closed with Insuff' report from the live Bridge database.
 
-Logs into https://mis.authbridge.com/export_query/, selects Host/Database/Data Time
-Slab/Query, fills the date range and client name, clicks Export, waits for the
-downloaded .zip, extracts the CSV into this folder, and removes the zip.
+Runs the three queries in queries.py (daily Done checks, Advance Tracker,
+Antecedent Details) directly against the live MySQL database, saves each result
+as a CSV next to this file, and builds the formatted Excel deliverable.
 """
 import math
 import os
-import time
-import zipfile
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pymysql
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import StaleElementReferenceException
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import Select, WebDriverWait
+
+from queries import ADVANCE_QUERY, ANTECEDENT_QUERY, DAILY_QUERY
 
 load_dotenv()
 
-LOGIN_URL = "https://mis.authbridge.com/export_query/login.php"
-USERNAME = os.environ["MIS_USERNAME"]
-PASSWORD = os.environ["MIS_PASSWORD"]
-
-HOST = "Bridge Live"
-DATABASE = "Bridge Live"
-DATA_TIME_SLAB = "Morning Data - Daily Dump"
-QUERY_NAME = "Yesterday Done checks with other details as per client name - Bridge"
 CLIENT_NAME = "Accenture Solutions Private Limited"
 
-ADVANCE_DATA_TIME_SLAB = "case query - Bridge"
-ADVANCE_QUERY_NAME = "Advance Tracker"
+DAILY_CSV_NAME = "Yesterday Done checks with other details as per client name - Bridge.csv"
+ADVANCE_CSV_NAME = "Advance Tracker.csv"
+ANTECEDENT_CSV_NAME = "Antecedent Details.csv"
 
-ANTECEDENT_DATA_TIME_SLAB = "checks query - Bridge"
-ANTECEDENT_QUERY_NAME = "Antecedent Details"
+# Columns the pipeline reads by name. MySQL can report a column in its table-
+# defined casing rather than the casing written in the query, so results are
+# renamed case-insensitively to these spellings.
+DAILY_COLUMNS = [
+    "case_check_id", "case_ars_no", "check_status", "case_received_date", "insuff_remarks",
+    "Insuff_fulfill_date", "case_flex_field1", "case_flex_field6",
+]
+ADVANCE_COLUMNS = ["Case_Check_id", "First_Insuff_Date", "verification_source", "Check_unique_name"]
+ANTECEDENT_COLUMNS = ["case_check_id", "field_name", "stated_data"]
 
 DOWNLOAD_DIR = Path(__file__).resolve().parent
 
@@ -134,143 +129,46 @@ def compute_date_range():
     return f"{from_date} 00:00:00", f"{to_date} 23:59:59"
 
 
-def build_driver(download_dir):
-    options = Options()
-    if os.environ.get("HEADLESS", "true").lower() != "false":
-        options.add_argument("--headless=new")
-    options.add_argument("--window-size=1600,1000")
-    options.add_experimental_option(
-        "prefs",
-        {
-            "download.default_directory": str(download_dir),
-            "download.prompt_for_download": False,
-            "safebrowsing.enabled": True,
-        },
-    )
-    driver = webdriver.Chrome(options=options)
-    driver.execute_cdp_cmd(
-        "Page.setDownloadBehavior",
-        {"behavior": "allow", "downloadPath": str(download_dir)},
-    )
-    return driver
-
-
-def select_dropdown(driver, name, text, timeout=20, attempts=3):
-    """Select an option by visible text, retrying on stale elements.
-
-    The site rebuilds each dependent <select> via AJAX after its parent
-    changes, so the node backing `name` can be swapped out between checking
-    its options and clicking one; retry the whole select on that race.
-    """
-    locator = (By.NAME, name)
-    for attempt in range(attempts):
-        try:
-            WebDriverWait(driver, timeout, ignored_exceptions=(StaleElementReferenceException,)).until(
-                lambda d: len(Select(d.find_element(*locator)).options) > 1
-            )
-            Select(driver.find_element(*locator)).select_by_visible_text(text)
-            return
-        except StaleElementReferenceException:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(0.5)
-
-
-def _retry_stale(action, attempts=3, delay=0.5):
-    """Run `action`, retrying it from scratch if the AJAX-rebuilt DOM makes
-    an element go stale mid-interaction."""
-    for attempt in range(attempts):
-        try:
-            return action()
-        except StaleElementReferenceException:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(delay)
-
-
-def login(driver):
-    driver.get(LOGIN_URL)
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.NAME, "username")))
-    driver.find_element(By.NAME, "username").send_keys(USERNAME)
-    driver.find_element(By.NAME, "password").send_keys(PASSWORD)
-    driver.find_element(By.NAME, "login").click()
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.NAME, "hostname")))
-
-
-def fill_query_form(driver, from_date, to_date):
-    select_dropdown(driver, "hostname", HOST)
-    select_dropdown(driver, "database", DATABASE)
-    select_dropdown(driver, "access_time", DATA_TIME_SLAB)
-    select_dropdown(driver, "csv_query", QUERY_NAME)
-
-    WebDriverWait(driver, 20, ignored_exceptions=(StaleElementReferenceException,)).until(
-        EC.presence_of_element_located((By.NAME, "date1"))
+def connect_db():
+    """Open a connection to the live database using DB_* settings from .env."""
+    return pymysql.connect(
+        host=os.environ["DB_HOST"],
+        port=int(os.environ.get("DB_PORT", "3306")),
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        database=os.environ.get("DB_NAME", "checkpoint_live"),
+        charset="utf8mb4",
+        connect_timeout=30,
     )
 
-    def fill_and_submit():
-        date1 = driver.find_element(By.NAME, "date1")
-        date2 = driver.find_element(By.NAME, "date2")
-        client1 = driver.find_element(By.NAME, "client1")
 
-        date1.clear()
-        date1.send_keys(from_date)
-        date2.clear()
-        date2.send_keys(to_date)
-        client1.clear()
-        client1.send_keys(CLIENT_NAME)
-
-        driver.find_element(By.ID, "run_query").click()
-
-    _retry_stale(fill_and_submit)
+def fetch_df(conn, query, params=(), expected_columns=()):
+    """Run `query` and return the result as a DataFrame, renaming columns
+    case-insensitively to the spellings in `expected_columns`."""
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        columns = [c[0] for c in cur.description]
+        rows = cur.fetchall()
+    wanted = {name.lower(): name for name in expected_columns}
+    columns = [wanted.get(c.lower(), c) for c in columns]
+    return pd.DataFrame(rows, columns=columns)
 
 
-def fill_check_id_query_form(driver, data_time_slab, query_name, value):
-    """Fill the shared 'check_id1' text field used by both the Advance
-    Tracker (ARS No*) and Antecedent Details (Check Id:*) queries."""
-    select_dropdown(driver, "access_time", data_time_slab)
-    select_dropdown(driver, "csv_query", query_name)
-
-    WebDriverWait(driver, 20, ignored_exceptions=(StaleElementReferenceException,)).until(
-        EC.presence_of_element_located((By.NAME, "check_id1"))
-    )
-
-    def fill_and_submit():
-        field = driver.find_element(By.NAME, "check_id1")
-        field.clear()
-        field.send_keys(value)
-        driver.find_element(By.ID, "run_query").click()
-
-    _retry_stale(fill_and_submit)
+def fetch_in_query(conn, query, values, expected_columns=()):
+    """Run a query containing an `{in_list}` slot, bound to `values`."""
+    in_list = ",".join(["%s"] * len(values))
+    return fetch_df(conn, query.format(in_list=in_list), values, expected_columns)
 
 
-def wait_for_download(download_dir, seen_before, timeout=120):
-    """Wait for a new *.zip to appear. Chrome only uses the final `.zip`
-    name once a download is complete (in-progress files are suffixed
-    `.crdownload`), so a new zip's mere presence proves it's done - do not
-    also gate on the absence of *any* .crdownload, since unrelated browser
-    downloads (e.g. Chrome's own background component fetches) can leave
-    stray .crdownload files that never resolve and would block forever."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        new_zips = [p for p in download_dir.glob("*.zip") if p not in seen_before]
-        if new_zips:
-            new_zips.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            return new_zips[0]
-        time.sleep(1)
-    raise TimeoutError("Timed out waiting for the export file to download.")
+def save_csv(df, name, log=print):
+    path = DOWNLOAD_DIR / name
+    df.to_csv(path, index=False)
+    log(f"Saved: {path}")
+    return path
 
 
-def extract_and_cleanup(zip_path):
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(zip_path.parent)
-        names = zf.namelist()
-    zip_path.unlink()
-    return [zip_path.parent / name for name in names]
-
-
-def load_closed_with_insuff(csv_path):
-    df = pd.read_csv(csv_path, encoding="latin-1")
-    return df[df["check_status"] == CHECK_STATUS_FILTER]
+def load_closed_with_insuff(daily_df):
+    return daily_df[daily_df["check_status"] == CHECK_STATUS_FILTER]
 
 
 def build_hrt_lookup(antecedent_df):
@@ -400,76 +298,56 @@ def build_insuff_report(closed, advance_df, antecedent_df, out_dir, component_ma
     return xlsx_path
 
 
-def build_ars_string(closed):
-    """Comma-separated, single-quoted ARS numbers (no trailing comma) for the
-    MIS 'ARS No*' field, e.g. '5269-080960','5269-075588'."""
-    unique_ars = list(dict.fromkeys(closed["case_ars_no"]))
-    return ",".join(f"'{ars}'" for ars in unique_ars)
+def build_ars_list(closed):
+    """Unique ARS numbers (order preserved) bound into the Advance Tracker
+    query's `case_ars_no IN (...)` clause."""
+    return [str(ars) for ars in dict.fromkeys(closed["case_ars_no"].dropna())]
 
 
-def build_check_id_string(closed):
-    """Comma-separated case_check_id values (no trailing comma, no quotes)
-    for the MIS 'Check Id:*' field, e.g. 2159938764,2158421704."""
-    unique_ids = list(dict.fromkeys(closed["case_check_id"].astype(str)))
-    return ",".join(unique_ids)
+def build_check_id_list(closed):
+    """Unique case_check_id values (order preserved) bound into the Antecedent
+    Details query's `case_check_id IN (...)` clause."""
+    return list(dict.fromkeys(closed["case_check_id"].dropna().astype(str)))
 
 
 def run_pipeline(component_map=None, log=print):
-    """Run the full export -> filter -> report pipeline and return a dict of
+    """Run the full query -> filter -> report pipeline and return a dict of
     the produced file paths (plus row counts) keyed by stage name."""
     from_date, to_date = compute_date_range()
-    log(f"Requesting export for {from_date} -> {to_date}")
+    log(f"Querying live database for {from_date} -> {to_date}")
 
     results = {"from_date": from_date, "to_date": to_date}
-    driver = build_driver(DOWNLOAD_DIR)
+    conn = connect_db()
     try:
-        seen_before = set(DOWNLOAD_DIR.glob("*.zip"))
-        login(driver)
-        fill_query_form(driver, from_date, to_date)
-        zip_path = wait_for_download(DOWNLOAD_DIR, seen_before)
-        extracted = extract_and_cleanup(zip_path)
-        for path in extracted:
-            log(f"Saved: {path}")
-        results["daily_csv"] = extracted[0]
+        daily_df = fetch_df(
+            conn, DAILY_QUERY, (from_date, to_date, f"%{CLIENT_NAME}%"), DAILY_COLUMNS
+        )
+        results["daily_csv"] = save_csv(daily_df, DAILY_CSV_NAME, log)
 
-        closed = load_closed_with_insuff(extracted[0])
+        closed = load_closed_with_insuff(daily_df)
         results["closed_rows"] = len(closed)
-        ars_string = build_ars_string(closed)
+        ars_list = build_ars_list(closed)
 
         advance_df = None
-        if ars_string:
-            seen_before = set(DOWNLOAD_DIR.glob("*.zip"))
-            fill_check_id_query_form(driver, ADVANCE_DATA_TIME_SLAB, ADVANCE_QUERY_NAME, ars_string)
-            zip_path = wait_for_download(DOWNLOAD_DIR, seen_before)
-            advance_paths = extract_and_cleanup(zip_path)
-            for path in advance_paths:
-                log(f"Saved: {path}")
-            advance_df = pd.read_csv(advance_paths[0], encoding="latin-1")
-            results["advance_csv"] = advance_paths[0]
+        if ars_list:
+            advance_df = fetch_in_query(conn, ADVANCE_QUERY, ars_list, ADVANCE_COLUMNS)
+            results["advance_csv"] = save_csv(advance_df, ADVANCE_CSV_NAME, log)
         else:
-            log("No 'Closed with Insufficiency' rows today; skipping Advance Tracker export.")
+            log("No 'Closed with Insufficiency' rows today; skipping Advance Tracker query.")
 
-        check_id_string = build_check_id_string(closed)
+        check_id_list = build_check_id_list(closed)
         antecedent_df = None
-        if check_id_string:
-            seen_before = set(DOWNLOAD_DIR.glob("*.zip"))
-            fill_check_id_query_form(
-                driver, ANTECEDENT_DATA_TIME_SLAB, ANTECEDENT_QUERY_NAME, check_id_string
-            )
-            zip_path = wait_for_download(DOWNLOAD_DIR, seen_before)
-            antecedent_paths = extract_and_cleanup(zip_path)
-            for path in antecedent_paths:
-                log(f"Saved: {path}")
-            antecedent_df = pd.read_csv(antecedent_paths[0], encoding="latin-1")
-            results["antecedent_csv"] = antecedent_paths[0]
+        if check_id_list:
+            antecedent_df = fetch_in_query(conn, ANTECEDENT_QUERY, check_id_list, ANTECEDENT_COLUMNS)
+            results["antecedent_csv"] = save_csv(antecedent_df, ANTECEDENT_CSV_NAME, log)
         else:
-            log("No 'Closed with Insufficiency' rows today; skipping Antecedent Details export.")
+            log("No 'Closed with Insufficiency' rows today; skipping Antecedent Details query.")
 
         xlsx_path = build_insuff_report(closed, advance_df, antecedent_df, DOWNLOAD_DIR, component_map)
         log(f"Saved: {xlsx_path}")
         results["report_xlsx"] = xlsx_path
     finally:
-        driver.quit()
+        conn.close()
 
     return results
 

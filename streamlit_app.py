@@ -1,6 +1,6 @@
 """Streamlit front-end for the Accenture 'Closed with Insuff' reporting pipeline.
 
-Runs the same login -> export -> filter -> report pipeline as `app.py`, with
+Runs the same query -> filter -> report pipeline as `app.py`, with
 an optional upload for the Check_unique_name -> Component mapping so business
 users can update it without touching code.
 """
@@ -21,9 +21,9 @@ from app import (
 st.set_page_config(page_title="Accenture Closed-with-Insuff Reporting", layout="wide")
 st.title("Accenture Closed-with-Insuff Reporting")
 st.caption(
-    "Logs into the AuthBridge MIS query browser, pulls the daily checks export, "
-    "the Advance Tracker and Antecedent Details exports, and builds the "
-    "formatted Closed-with-Insufficiency report."
+    "Queries the live Bridge database for the daily checks, the Advance Tracker "
+    "and Antecedent Details data, and builds the formatted "
+    "Closed-with-Insufficiency report."
 )
 
 if "results" not in st.session_state:
@@ -105,7 +105,7 @@ if results:
     }
     raw_files = {label: path for label, path in raw_files.items() if path is not None}
     if raw_files:
-        with st.expander("Raw CSV exports"):
+        with st.expander("Raw query results (CSV)"):
             for label, path in raw_files.items():
                 with open(path, "rb") as f:
                     st.download_button(f"Download {label} ({path.name})", data=f.read(), file_name=path.name)
